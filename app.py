@@ -6,6 +6,12 @@ from bs4 import BeautifulSoup
 from datetime import date, timedelta
 import io
 
+try:
+    import lseg.data as ld
+    LSEG_AVAILABLE = True
+except ImportError:
+    LSEG_AVAILABLE = False
+
 st.set_page_config(
     page_title="Market Benchmark Indices",
     page_icon="📊",
@@ -134,6 +140,47 @@ JPM_INDICES = {
     },
 }
 
+FRED_INDICES = {
+    "BAMLHE00EHYIEY": {
+        "label": "BAMLHE00EHYIEY – Euro HY Effective Yield",
+        "full_name": "ICE BofA Euro High Yield Index, Effective Yield",
+        "description": (
+            "Effective yield of the ICE BofA Euro High Yield Index, tracking EUR-denominated "
+            "sub-investment-grade corporate bonds. Key indicator of credit risk premium "
+            "in European high-yield markets. Sourced from FRED (Federal Reserve Bank of St. Louis)."
+        ),
+        "color": "rgb(0, 180, 216)",
+        "inception": "Jan 1998",
+        "frequency": "Daily",
+    },
+    "BAMLH0A0HYM2EY": {
+        "label": "BAMLH0A0HYM2EY – US HY Effective Yield",
+        "full_name": "ICE BofA US High Yield Master II Index, Effective Yield",
+        "description": (
+            "Effective yield of the ICE BofA US High Yield Master II Index, tracking "
+            "USD-denominated sub-investment-grade corporate bonds. Benchmark indicator "
+            "for US high-yield credit conditions. Sourced from FRED (Federal Reserve Bank of St. Louis)."
+        ),
+        "color": "rgb(255, 140, 0)",
+        "inception": "Dec 1996",
+        "frequency": "Daily",
+    },
+}
+
+REFINITIV_INDICES = {
+    ".FTEHYMEURT": {
+        "label": ".FTEHYMEURT – FTSE Euro HY Market EUR TR",
+        "full_name": "FTSE Euro High Yield Market EUR Total Return Index",
+        "description": (
+            "Total return index measuring performance of EUR-denominated sub-investment-grade "
+            "corporate bonds across developed European markets. Used as broad HY credit benchmark."
+        ),
+        "color": "rgb(220, 100, 180)",
+        "inception": "Jan 2000",
+        "frequency": "Daily",
+    },
+}
+
 # ── Static fallback – Flat Rock CLO Equity (scraped 2026-05-17) ───────────────
 FLATROCK_CSV = """Date,Index Level,Quarterly Return,Yearly Return
 2014-09-30,100.00,,
@@ -240,6 +287,77 @@ def load_flatrock() -> tuple[pd.DataFrame, str]:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_fred(series_id: str) -> tuple[pd.DataFrame, str]:
+    try:
+        api_key = st.secrets.get("FRED_API_KEY", "")
+        if not api_key:
+            return pd.DataFrame(), "no_key"
+        url = (
+            f"https://api.stlouisfed.org/fred/series/observations"
+            f"?series_id={series_id}&api_key={api_key}&file_type=json&observation_start=1990-01-01"
+        )
+        resp = requests.get(url, headers={"User-Agent": _JPM_HEADERS["User-Agent"]}, timeout=15)
+        resp.raise_for_status()
+        obs = resp.json().get("observations", [])
+        if not obs:
+            return pd.DataFrame(), "error"
+        df = pd.DataFrame(obs)[["date", "value"]].rename(columns={"date": "Date", "value": "Value"})
+        df["Date"] = pd.to_datetime(df["Date"])
+        df["Value"] = pd.to_numeric(df["Value"], errors="coerce")
+        df = df.dropna().sort_values("Date").reset_index(drop=True)
+        return df, "live"
+    except Exception:
+        return pd.DataFrame(), "error"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_refinitiv(ric: str) -> tuple[pd.DataFrame, str]:
+    if not LSEG_AVAILABLE:
+        return pd.DataFrame(), "no_lib"
+    try:
+        ref = st.secrets.get("refinitiv", {})
+        if not ref.get("app_key"):
+            return pd.DataFrame(), "no_key"
+        session = ld.session.platform.Definition(
+            app_key=ref["app_key"],
+            grant=ld.session.platform.GrantPassword(
+                username=ref["username"],
+                password=ref["password"],
+            ),
+            signon_control=True,
+        ).get_session()
+        session.open()
+        ld.session.set_default(session)
+        try:
+            df_raw = ld.get_history(
+                universe=ric,
+                start="1998-01-01",
+                end=date.today().isoformat(),
+            )
+        finally:
+            session.close()
+        if df_raw is None or df_raw.empty:
+            return pd.DataFrame(), "error"
+        df_raw = df_raw.reset_index()
+        date_col = df_raw.columns[0]
+        num_cols = [
+            c for c in df_raw.columns[1:]
+            if pd.to_numeric(df_raw[c], errors="coerce").notna().any()
+        ]
+        if not num_cols:
+            return pd.DataFrame(), "error"
+        df_raw = df_raw[[date_col, num_cols[0]]].copy()
+        df_raw.columns = ["Date", "Index Level"]
+        dates = pd.to_datetime(df_raw["Date"])
+        df_raw["Date"] = dates.dt.tz_convert(None) if dates.dt.tz is not None else dates
+        df_raw["Index Level"] = pd.to_numeric(df_raw["Index Level"], errors="coerce")
+        df_raw = df_raw.dropna(subset=["Index Level"]).sort_values("Date").reset_index(drop=True)
+        return df_raw, "live"
+    except Exception:
+        return pd.DataFrame(), "error"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_jpmorgan(ticker: str) -> tuple[pd.DataFrame, str]:
     try:
         resp = requests.get(
@@ -294,6 +412,23 @@ def _stats_daily(df: pd.DataFrame) -> dict:
         "Ann. Volatility": f"{vol:.1f}%",
         "Max Drawdown": f"{max_dd:.1f}%",
         "Current Level": f"{e:.4f}",
+        "Last Update": df["Date"].iloc[-1].strftime("%d %b %Y"),
+    }
+
+
+def _stats_yield(df: pd.DataFrame) -> dict:
+    if df.empty or len(df) < 2:
+        return {}
+    last = df["Value"].iloc[-1]
+    cutoff_1y = df["Date"].iloc[-1] - pd.Timedelta(days=365)
+    year_data = df[df["Date"] >= cutoff_1y]["Value"]
+    ytd_start = df[df["Date"].dt.year == df["Date"].iloc[-1].year]["Value"]
+    ytd_chg = (last - ytd_start.iloc[0]) * 100 if not ytd_start.empty else None
+    return {
+        "Current Yield": f"{last:.2f}%",
+        "52W High": f"{year_data.max():.2f}%",
+        "52W Low": f"{year_data.min():.2f}%",
+        "YTD Change": f"{ytd_chg:+.0f} bps" if ytd_chg is not None else "—",
         "Last Update": df["Date"].iloc[-1].strftime("%d %b %Y"),
     }
 
@@ -367,8 +502,78 @@ def render_jpm_index(ticker: str, df: pd.DataFrame, source: str,
             st.warning("No data in selected range.")
             return
 
-        rebase = dff["Index Level"].iloc[0]
-        dff["Index Rebased"] = dff["Index Level"] / rebase * 100
+        stats = _stats_daily(dff)
+        cols = st.columns(len(stats))
+        for col, (lbl, val) in zip(cols, stats.items()):
+            col.metric(lbl, val)
+
+        st.divider()
+
+        fig = _level_chart(dff, "Index Level", "Index Level", meta["color"], ticker, chart_type)
+        fig.update_layout(**_base_layout(f"{ticker} Index Level", "Index Level"))
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def render_fred_index(series_id: str, df: pd.DataFrame, source: str,
+                      date_range: tuple, chart_type: str) -> None:
+    meta = FRED_INDICES[series_id]
+    badge = "🟢 Live" if source == "live" else "🔴 Error"
+
+    with st.expander(meta["label"], expanded=True):
+        st.markdown(f"*{meta['description']}*")
+        st.caption(f"Inception: {meta['inception']} · {meta['frequency']} · fred.stlouisfed.org · {badge}")
+
+        if source == "no_key":
+            st.warning("FRED API key not configured. Add FRED_API_KEY to Streamlit secrets.")
+            return
+        if source == "error" or df.empty:
+            st.error(f"Could not fetch {series_id} data from FRED.")
+            return
+
+        mask = (df["Date"].dt.date >= date_range[0]) & (df["Date"].dt.date <= date_range[1])
+        dff = df[mask].copy()
+
+        if dff.empty:
+            st.warning("No data in selected range.")
+            return
+
+        stats = _stats_yield(dff)
+        cols = st.columns(len(stats))
+        for col, (lbl, val) in zip(cols, stats.items()):
+            col.metric(lbl, val)
+
+        st.divider()
+
+        fig = _level_chart(dff, "Value", "Effective Yield (%)", meta["color"], series_id, chart_type)
+        fig.update_layout(**_base_layout(f"{series_id} – Effective Yield", "Yield (%)"))
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def render_refinitiv_index(ric: str, df: pd.DataFrame, source: str,
+                           date_range: tuple, chart_type: str) -> None:
+    meta = REFINITIV_INDICES[ric]
+    badge = "🟢 Live" if source == "live" else "🔴 Error"
+
+    with st.expander(meta["label"], expanded=True):
+        st.markdown(f"*{meta['description']}*")
+        st.caption(f"Inception: {meta['inception']} · {meta['frequency']} · Refinitiv/LSEG · {badge}")
+
+        if source == "no_key":
+            st.warning("Refinitiv credentials not configured in Streamlit secrets.")
+            return
+        if source == "no_lib":
+            st.warning("lseg-data library not installed. Run: pip install lseg-data")
+            return
+        if source == "error" or df.empty:
+            st.error(f"Could not fetch {ric} data from Refinitiv.")
+            return
+
+        mask = (df["Date"].dt.date >= date_range[0]) & (df["Date"].dt.date <= date_range[1])
+        dff = df[mask].copy()
+
+        if dff.empty:
+            st.warning("No data in selected range.")
+            return
 
         stats = _stats_daily(dff)
         cols = st.columns(len(stats))
@@ -377,12 +582,8 @@ def render_jpm_index(ticker: str, df: pd.DataFrame, source: str,
 
         st.divider()
 
-        global_min = df["Date"].dt.date.min()
-        y_col = "Index Rebased" if date_range[0] > global_min else "Index Level"
-        y_label = "Index Level (rebased to 100)" if y_col == "Index Rebased" else "Index Level"
-
-        fig = _level_chart(dff, y_col, y_label, meta["color"], ticker, chart_type)
-        fig.update_layout(**_base_layout(f"{ticker} Index Level", y_label))
+        fig = _level_chart(dff, "Index Level", "Index Level", meta["color"], ric, chart_type)
+        fig.update_layout(**_base_layout(f"{ric} Index Level", "Index Level"))
         st.plotly_chart(fig, use_container_width=True)
 
 
@@ -409,15 +610,33 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Indices")
-    show_flatrock = st.checkbox("Flat Rock CLO Equity (quarterly)", value=True)
-    jpm_enabled = {
-        ticker: st.checkbox(meta["label"], value=True)
-        for ticker, meta in JPM_INDICES.items()
-    }
 
-    st.divider()
-    st.subheader("Chart options")
-    chart_type = st.radio("Index level display", ["Line", "Area"], horizontal=True)
+    _EU_JPM  = ["JPIBHYET", "JCREVCM1", "JCREVCX1"]
+    _US_JPM  = ["JCRELCGH"]
+    _EU_FRED = ["BAMLHE00EHYIEY"]
+    _US_FRED = ["BAMLH0A0HYM2EY"]
+    _EU_REF  = [".FTEHYMEURT"]
+
+    jpm_enabled       = {}
+    fred_enabled      = {}
+    refinitiv_enabled = {}
+
+    with st.expander("🇪🇺 EU Exposure", expanded=True):
+        for t in _EU_JPM:
+            jpm_enabled[t] = st.checkbox(JPM_INDICES[t]["label"], value=True, key=f"idx_{t}")
+        for s in _EU_FRED:
+            fred_enabled[s] = st.checkbox(FRED_INDICES[s]["label"], value=True, key=f"idx_{s}")
+        for r in _EU_REF:
+            refinitiv_enabled[r] = st.checkbox(REFINITIV_INDICES[r]["label"], value=True, key=f"idx_{r}")
+
+    with st.expander("🇺🇸 US Exposure", expanded=True):
+        show_flatrock = st.checkbox("Flat Rock CLO Equity (quarterly)", value=True, key="idx_flatrock")
+        for t in _US_JPM:
+            jpm_enabled[t] = st.checkbox(JPM_INDICES[t]["label"], value=True, key=f"idx_{t}")
+        for s in _US_FRED:
+            fred_enabled[s] = st.checkbox(FRED_INDICES[s]["label"], value=True, key=f"idx_{s}")
+
+    chart_type = "Line"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Load data
@@ -429,6 +648,14 @@ with st.spinner("Loading data…"):
     for ticker, enabled in jpm_enabled.items():
         if enabled:
             jpm_data[ticker] = load_jpmorgan(ticker)
+    fred_data: dict[str, tuple[pd.DataFrame, str]] = {}
+    for series_id, enabled in fred_enabled.items():
+        if enabled:
+            fred_data[series_id] = load_fred(series_id)
+    refinitiv_data: dict[str, tuple[pd.DataFrame, str]] = {}
+    for ric, enabled in refinitiv_enabled.items():
+        if enabled:
+            refinitiv_data[ric] = load_refinitiv(ric)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Global date range
@@ -436,6 +663,12 @@ with st.spinner("Loading data…"):
 
 all_dates = list(fr_df["Date"].dt.date)
 for df, _ in jpm_data.values():
+    if not df.empty:
+        all_dates += list(df["Date"].dt.date)
+for df, _ in fred_data.values():
+    if not df.empty:
+        all_dates += list(df["Date"].dt.date)
+for df, _ in refinitiv_data.values():
     if not df.empty:
         all_dates += list(df["Date"].dt.date)
 
@@ -490,9 +723,10 @@ def _build_combined_series(
     show_flatrock: bool,
     fr_df: pd.DataFrame,
     jpm_data: dict,
+    fred_data: dict,
+    refinitiv_data: dict,
     date_range: tuple,
 ) -> list[dict]:
-    """Return list of {name, color, dates, levels} for all enabled, non-empty indices."""
     series = []
 
     if show_flatrock:
@@ -504,6 +738,7 @@ def _build_combined_series(
                 "color": "rgb(99,110,250)",
                 "dates": df_f["Date"],
                 "levels": df_f["Index Level"],
+                "is_yield": False,
             })
 
     for ticker, (df, source) in jpm_data.items():
@@ -518,51 +753,67 @@ def _build_combined_series(
             "color": JPM_INDICES[ticker]["color"],
             "dates": dff["Date"],
             "levels": dff["Index Level"],
+            "is_yield": False,
+        })
+
+    for series_id, (df, source) in fred_data.items():
+        if source in ("error", "no_key") or df.empty:
+            continue
+        mask = (df["Date"].dt.date >= date_range[0]) & (df["Date"].dt.date <= date_range[1])
+        dff = df[mask].dropna(subset=["Value"])
+        if dff.empty:
+            continue
+        series.append({
+            "name": series_id,
+            "color": FRED_INDICES[series_id]["color"],
+            "dates": dff["Date"],
+            "levels": dff["Value"],
+            "is_yield": True,
+        })
+
+    for ric, (df, source) in refinitiv_data.items():
+        if source in ("error", "no_key", "no_lib") or df.empty:
+            continue
+        mask = (df["Date"].dt.date >= date_range[0]) & (df["Date"].dt.date <= date_range[1])
+        dff = df[mask].dropna(subset=["Index Level"])
+        if dff.empty:
+            continue
+        series.append({
+            "name": ric,
+            "color": REFINITIV_INDICES[ric]["color"],
+            "dates": dff["Date"],
+            "levels": dff["Index Level"],
+            "is_yield": False,
         })
 
     return series
 
 
-combined = _build_combined_series(show_flatrock, fr_df, jpm_data, date_range)
+combined = _build_combined_series(show_flatrock, fr_df, jpm_data, fred_data, refinitiv_data, date_range)
 
 if len(combined) >= 1:
     st.subheader("Combined Performance")
 
+    # Cumulative return — all series (FRED: % change in yield from period start)
     fig_ret = go.Figure()
     for s in combined:
         base = s["levels"].iloc[0]
         cum_ret = (s["levels"] / base - 1) * 100
+        suffix = " (yield Δ%)" if s["is_yield"] else ""
         fig_ret.add_trace(go.Scatter(
             x=s["dates"], y=cum_ret,
-            name=s["name"],
+            name=s["name"] + suffix,
             line=dict(color=s["color"], width=2),
             hovertemplate="%{x|%d %b %Y}<br>" + s["name"] + ": %{y:+.2f}%<extra></extra>",
         ))
     fig_ret.add_hline(y=0, line_color=_ZERO_COLOR)
-    fig_ret.update_layout(**_base_layout("Cumulative Return (%)", "Return (%)", 440))
+    fig_ret.update_layout(**_base_layout("Cumulative Return / Yield Change (%)", "Return (%)", 440))
     fig_ret.update_layout(
         legend=dict(orientation="h", yanchor="top", y=-0.12, xanchor="center", x=0.5),
         margin=dict(l=0, r=0, t=40, b=60),
     )
     _style(fig_ret)
     st.plotly_chart(fig_ret, use_container_width=True)
-
-    # Chart – actual index levels (raw values from source)
-    fig_lvl = go.Figure()
-    for s in combined:
-        fig_lvl.add_trace(go.Scatter(
-            x=s["dates"], y=s["levels"],
-            name=s["name"],
-            line=dict(color=s["color"], width=2),
-            hovertemplate="%{x|%d %b %Y}<br>" + s["name"] + ": %{y:.4f}<extra></extra>",
-        ))
-    fig_lvl.update_layout(**_base_layout("Index Level (actual)", "Level", 440))
-    fig_lvl.update_layout(
-        legend=dict(orientation="h", yanchor="top", y=-0.12, xanchor="center", x=0.5),
-        margin=dict(l=0, r=0, t=40, b=60),
-    )
-    _style(fig_lvl)
-    st.plotly_chart(fig_lvl, use_container_width=True)
 
     st.divider()
 
@@ -588,9 +839,6 @@ if show_flatrock:
         if df_f.empty:
             st.warning("No data in selected range.")
         else:
-            rebase = df_f["Index Level"].iloc[0]
-            df_f["Index Rebased"] = df_f["Index Level"] / rebase * 100
-
             stats = _stats_quarterly(df_f)
             cols = st.columns(len(stats))
             for col, (lbl, val) in zip(cols, stats.items()):
@@ -598,12 +846,8 @@ if show_flatrock:
 
             st.divider()
 
-            global_min_fr = fr_df["Date"].dt.date.min()
-            y_col = "Index Rebased" if date_range[0] > global_min_fr else "Index Level"
-            y_label = "Index Level (rebased to 100)" if y_col == "Index Rebased" else "Index Level"
-
-            fig_fr = _level_chart(df_f, y_col, y_label, "rgb(99,110,250)", "CLO Equity", chart_type, "%b %Y")
-            fig_fr.update_layout(**_base_layout("CLO Equity Index Level", y_label))
+            fig_fr = _level_chart(df_f, "Index Level", "Index Level", "rgb(99,110,250)", "CLO Equity", chart_type, "%b %Y")
+            fig_fr.update_layout(**_base_layout("CLO Equity Index Level", "Index Level"))
             st.plotly_chart(fig_fr, use_container_width=True)
 
             with st.expander("Raw data"):
@@ -628,11 +872,38 @@ for ticker, (df, source) in jpm_data.items():
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Sections – FRED yield indices
+# ─────────────────────────────────────────────────────────────────────────────
+
+for series_id, (df, source) in fred_data.items():
+    render_fred_index(
+        series_id=series_id,
+        df=df,
+        source=source,
+        date_range=date_range,
+        chart_type=chart_type,
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sections – Refinitiv/LSEG daily indices
+# ─────────────────────────────────────────────────────────────────────────────
+
+for ric, (df, source) in refinitiv_data.items():
+    render_refinitiv_index(
+        ric=ric,
+        df=df,
+        source=source,
+        date_range=date_range,
+        chart_type=chart_type,
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Footer
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.divider()
 st.caption(
-    "Sources: Flat Rock Global (flatrockglobal.com) · J.P. Morgan Strategic Indices (jpmorganindices.com). "
+    "Sources: Flat Rock Global (flatrockglobal.com) · J.P. Morgan Strategic Indices (jpmorganindices.com) · "
+    "FRED, Federal Reserve Bank of St. Louis (fred.stlouisfed.org) · Refinitiv/LSEG. "
     "For informational purposes only. Not investment advice."
 )
