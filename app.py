@@ -411,7 +411,7 @@ def _stats_daily(df: pd.DataFrame) -> dict:
         "Ann. Return": f"{((e/s)**(1/yrs) - 1)*100:.1f}%" if yrs > 0 else "—",
         "Ann. Volatility": f"{vol:.1f}%",
         "Max Drawdown": f"{max_dd:.1f}%",
-        "Current Level": f"{e:.4f}",
+        "Current Level": f"{e:.2f}",
         "Last Update": df["Date"].iloc[-1].strftime("%d %b %Y"),
     }
 
@@ -462,7 +462,7 @@ def _level_chart(df: pd.DataFrame, y_col: str, y_label: str, color: str,
     kwargs = dict(
         x=df["Date"], y=df[y_col],
         line=dict(color=color, width=2.5), name=name,
-        hovertemplate=f"%{{x|{date_fmt}}}<br>Level: %{{y:.4f}}<extra></extra>",
+        hovertemplate=f"%{{x|{date_fmt}}}<br>Level: %{{y:.2f}}<extra></extra>",
     )
     if chart_type == "Area":
         r, g, b = _parse_rgb(color)
@@ -511,7 +511,7 @@ def render_jpm_index(ticker: str, df: pd.DataFrame, source: str,
 
         fig = _level_chart(dff, "Index Level", "Index Level", meta["color"], ticker, chart_type)
         fig.update_layout(**_base_layout(f"{ticker} Index Level", "Index Level"))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 
 def render_fred_index(series_id: str, df: pd.DataFrame, source: str,
@@ -546,7 +546,7 @@ def render_fred_index(series_id: str, df: pd.DataFrame, source: str,
 
         fig = _level_chart(dff, "Value", "Effective Yield (%)", meta["color"], series_id, chart_type)
         fig.update_layout(**_base_layout(f"{series_id} – Effective Yield", "Yield (%)"))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 
 def render_refinitiv_index(ric: str, df: pd.DataFrame, source: str,
@@ -584,7 +584,7 @@ def render_refinitiv_index(ric: str, df: pd.DataFrame, source: str,
 
         fig = _level_chart(dff, "Index Level", "Index Level", meta["color"], ric, chart_type)
         fig.update_layout(**_base_layout(f"{ric} Index Level", "Index Level"))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -604,7 +604,7 @@ with st.sidebar:
         <div style="font-size:0.65rem;letter-spacing:0.12em;text-transform:uppercase;opacity:0.4;">Controls</div>
     </div>
     """, unsafe_allow_html=True)
-    if st.button("Refresh live data", use_container_width=True):
+    if st.button("Refresh live data", width='stretch'):
         st.cache_data.clear()
         st.rerun()
 
@@ -798,7 +798,7 @@ if len(combined) >= 1:
     fig_ret = go.Figure()
     for s in combined:
         base = s["levels"].iloc[0]
-        cum_ret = (s["levels"] / base - 1) * 100
+        cum_ret = ((s["levels"] / base - 1) * 100).round(2)
         suffix = " (yield Δ%)" if s["is_yield"] else ""
         fig_ret.add_trace(go.Scatter(
             x=s["dates"], y=cum_ret,
@@ -811,9 +811,11 @@ if len(combined) >= 1:
     fig_ret.update_layout(
         legend=dict(orientation="h", yanchor="top", y=-0.12, xanchor="center", x=0.5),
         margin=dict(l=0, r=0, t=40, b=60),
+        yaxis_hoverformat="+.2f",
+        yaxis_tickformat=".2f",
     )
     _style(fig_ret)
-    st.plotly_chart(fig_ret, use_container_width=True)
+    st.plotly_chart(fig_ret, width='stretch')
 
     st.divider()
 
@@ -848,7 +850,7 @@ if show_flatrock:
 
             fig_fr = _level_chart(df_f, "Index Level", "Index Level", "rgb(99,110,250)", "CLO Equity", chart_type, "%b %Y")
             fig_fr.update_layout(**_base_layout("CLO Equity Index Level", "Index Level"))
-            st.plotly_chart(fig_fr, use_container_width=True)
+            st.plotly_chart(fig_fr, width='stretch')
 
             with st.expander("Raw data"):
                 disp = df_f[["Date", "Index Level", "Quarterly Return", "Yearly Return"]].copy()
@@ -856,7 +858,7 @@ if show_flatrock:
                 disp["Quarterly Return"] = disp["Quarterly Return"].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "—")
                 disp["Yearly Return"] = disp["Yearly Return"].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "—")
                 disp["Index Level"] = disp["Index Level"].apply(lambda x: f"{x:.2f}")
-                st.dataframe(disp, use_container_width=True, hide_index=True)
+                st.dataframe(disp, width='stretch', hide_index=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sections 2-5 – JP Morgan daily indices
